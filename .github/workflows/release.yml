@@ -1,0 +1,58 @@
+name: Publish Windows game
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: public-game-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Build Windows game
+        shell: powershell
+        run: ./star-atelier/desktop/build.ps1 -OutputPath (Join-Path $env:RUNNER_TEMP 'AradoLadies.exe')
+
+      - name: Publish the current executable
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          tag="game-$GITHUB_SHA"
+          file="$(cygpath -u "$RUNNER_TEMP")/AradoLadies.exe"
+          if [[ "$(gh api "repos/$repo/git/ref/heads/main" --jq .object.sha)" != "$GITHUB_SHA" ]]; then
+            exit 0
+          fi
+
+          releases="$(gh api --paginate "repos/$repo/releases?per_page=100" --jq '.[] | [.tag_name, .draft] | @tsv')"
+          if ! grep -Fxq "$tag"$'\tfalse' <<< "$releases"; then
+            if ! grep -Fxq "$tag"$'\ttrue' <<< "$releases"; then
+              gh release create "$tag" --repo "$repo" --target "$GITHUB_SHA" --draft \
+                --title '아라도 숙녀들' --notes 'Windows에서 AradoLadies.exe를 다운로드해 실행하세요.'
+            fi
+            gh release upload "$tag" "$file" --repo "$repo" --clobber
+            id="$(gh release view "$tag" --repo "$repo" --json databaseId --jq .databaseId)"
+            uploaded="$(gh api "repos/$repo/releases/$id/assets" --jq 'if length == 1 and .[0].name == "AradoLadies.exe" then .[0].digest else "invalid" end')"
+            expected="sha256:$(sha256sum "$file" | cut -d' ' -f1)"
+            [[ "$uploaded" == "$expected" ]]
+            gh release edit "$tag" --repo "$repo" --draft=false --latest
+          fi
+
+          [[ "$(gh api "repos/$repo/releases/latest" --jq .tag_name)" == "$tag" ]]
+          while IFS=$'\t' read -r previous draft; do
+            if [[ "$draft" == false && "$previous" != "$tag" && "$previous" =~ ^game-[0-9a-f]{40}$ ]]; then
+              gh release delete "$previous" --repo "$repo" --cleanup-tag --yes
+            fi
+          done <<< "$releases"
